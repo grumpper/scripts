@@ -32,6 +32,7 @@ from collections import defaultdict
 
 from google.cloud import asset_v1, resourcemanager_v3
 
+
 OUTPUT_FILE = "effective_user_access.csv"
 ASSET_TYPES = [
     "cloudresourcemanager.googleapis.com/Organization",
@@ -91,9 +92,29 @@ def get_resource_names(client, organization):
     return names
 
 
-def analyze_iam(client, organization_name):
+def get_relevant_roles(client, organization_name):
+    """Return roles used on Organization, Folder, or Project IAM bindings."""
+    request = asset_v1.SearchAllIamPoliciesRequest(
+        scope=organization_name,
+        asset_types=ASSET_TYPES,
+    )
+
+    roles = set()
+    for policy in client.search_all_iam_policies(request=request):
+        for binding in policy.policy.bindings:
+            if binding.role:
+                roles.add(binding.role)
+
+    return sorted(roles)
+
+
+def analyze_iam(client, organization_name, roles):
+    """Analyze all relevant IAM roles and expand Google Group membership."""
     query = asset_v1.IamPolicyAnalysisQuery(
         scope=organization_name,
+        access_selector=asset_v1.IamPolicyAnalysisQuery.AccessSelector(
+            roles=roles,
+        ),
         options=asset_v1.IamPolicyAnalysisQuery.Options(
             expand_groups=True,
             output_group_edges=True,
@@ -215,16 +236,22 @@ def main():
     print("Resolving Organization, Folder and Project display names...")
     resource_names = get_resource_names(asset_client, organization)
 
-    print("Analyzing IAM and expanding Google Groups...")
-    users = build_inventory(
-        analyze_iam(asset_client, organization.name),
-        resource_names,
-    )
+    print("Discovering IAM roles used at Organization, Folder and Project level...")
+    roles = get_relevant_roles(asset_client, organization.name)
+
+    if roles:
+        print("Analyzing IAM and expanding Google Groups...")
+        users = build_inventory(
+            analyze_iam(asset_client, organization.name, roles),
+            resource_names,
+        )
+    else:
+        users = {}
     write_csv(users)
 
-    print("\n=============== SUMMARY ===============")
     print(f"Report written to: ./{OUTPUT_FILE}")
-    print(f"Unique human users with GCP IAM access: {len(users)}")
+    print("\n========== SUMMARY ==========")
+    print(f"Unique human users: {len(users)}")
 
 
 if __name__ == "__main__":
