@@ -3,44 +3,34 @@
 GCP Human IAM User Inventory
 
 Creates effective_user_access.csv with one row per unique human user that has
-IAM access assigned at Organization, Folder, or Project level in the single GCP
-organization visible to the current Application Default Credentials.
+an IAM allow-policy binding at Organization, Folder, or Project level.
 
-Direct user grants and Google Group grants are included. Groups are recursively
-expanded, including nested groups. Service accounts are excluded.
+Google Groups are expanded by Cloud Asset Policy Analyzer, including nested
+groups.
 
 CSV columns:
     user, group, resource, role
 
-Resources are shown with their type, display name, and identifier where available,
-for example: project:Payments Production (my-project-id).
+Multiple groups/resources/roles are semicolon-separated and independently
+aggregated. Resource-level IAM below Project and non-human principals are
+excluded. Conditional bindings are marked "[conditional]" in the role column.
 
-Multiple groups/resources/roles are semicolon-separated.
+Required APIs:
+    cloudasset.googleapis.com
+    cloudresourcemanager.googleapis.com
 
-Dependencies:
+Required Python packages:
+    pip install google-cloud-asset google-cloud-resource-manager
 
-    Python:
-        pip install google-cloud-asset google-api-python-client google-auth
-
-    Enabled GCP APIs:
-        cloudasset.googleapis.com
-        cloudresourcemanager.googleapis.com
-        cloudidentity.googleapis.com
-
-    Permissions:
-        roles/resourcemanager.organizationViewer
-        roles/cloudasset.viewer
-        roles/serviceusage.serviceUsageConsumer
+Group expansion requires the Google Workspace `groups.read` privilege and is
+capped by Google at 1,000 members per group.
 """
 
 import csv
 import sys
 from collections import defaultdict
 
-import google.auth
-from google.cloud import asset_v1
-from googleapiclient.discovery import build
-
+from google.cloud import asset_v1, resourcemanager_v3
 
 OUTPUT_FILE = "effective_user_access.csv"
 ASSET_TYPES = [
@@ -48,202 +38,193 @@ ASSET_TYPES = [
     "cloudresourcemanager.googleapis.com/Folder",
     "cloudresourcemanager.googleapis.com/Project",
 ]
+RESOURCE_PREFIXES = {
+    "//cloudresourcemanager.googleapis.com/organizations/": "organization",
+    "//cloudresourcemanager.googleapis.com/folders/": "folder",
+    "//cloudresourcemanager.googleapis.com/projects/": "project",
+}
 
 
-def get_organization(credentials):
-    service = build(
-        "cloudresourcemanager", "v3",
-        credentials=credentials,
-        cache_discovery=False,
+def get_organization():
+    organizations = list(
+        resourcemanager_v3.OrganizationsClient().search_organizations()
     )
-    orgs = service.organizations().search(pageSize=100).execute(num_retries=3).get(
-        "organizations", []
-    )
-
-    if len(orgs) != 1:
+    if len(organizations) != 1:
         raise RuntimeError(
-            f"Expected exactly one visible GCP organization, found {len(orgs)}."
+            f"Expected exactly one visible GCP organization, found {len(organizations)}."
         )
-
-    return orgs[0]
-
-
-def resource_key(resource):
-    """Return a stable type:id key for a Resource Manager resource name."""
-    resource_id = resource.rsplit("/", 1)[-1]
-
-    for plural, singular in (
-            ("/organizations/", "organization"),
-            ("/folders/", "folder"),
-            ("/projects/", "project"),
-    ):
-        if plural in resource:
-            return f"{singular}:{resource_id}"
-
-    return resource
+    return organizations[0]
 
 
-def get_resource_names(org_name, organization, credentials):
-    """Build a type:id -> human-friendly display name map in one asset search."""
-    client = asset_v1.AssetServiceClient(credentials=credentials)
-    names = {
-        resource_key(f"//cloudresourcemanager.googleapis.com/{org_name}"):
-            f"organization:{organization.get('displayName', org_name)} "
-            f"({org_name.rsplit('/', 1)[-1]})"
-    }
+def resource_type(name):
+    return next(
+        (kind for prefix, kind in RESOURCE_PREFIXES.items() if name.startswith(prefix)),
+        None,
+    )
 
+
+def get_resource_names(client, organization):
+    names = {}
     request = asset_v1.SearchAllResourcesRequest(
-        scope=org_name,
+        scope=organization.name,
         asset_types=ASSET_TYPES,
     )
 
-    for result in client.search_all_resources(request=request):
-        key = resource_key(result.name)
-        resource_type, _, resource_id = key.partition(":")
-        display_name = result.display_name
+    for resource in client.search_all_resources(request=request):
+        kind = resource_type(resource.name)
+        if not kind:
+            continue
 
-        names[key] = (
-            f"{resource_type}:{display_name} ({resource_id})"
-            if display_name
-            else key
+        resource_id = resource.name.rsplit("/", 1)[-1]
+        names[resource.name] = (
+            f"{kind}:{resource.display_name} ({resource_id})"
+            if resource.display_name
+            else f"{kind}:{resource_id}"
         )
 
+    org_id = organization.name.rsplit("/", 1)[-1]
+    org_full_name = f"//cloudresourcemanager.googleapis.com/{organization.name}"
+    names.setdefault(
+        org_full_name,
+        f"organization:{organization.display_name or org_id} ({org_id})",
+    )
     return names
 
 
-def get_iam_bindings(org_name, credentials, resource_names):
-    client = asset_v1.AssetServiceClient(credentials=credentials)
-    request = asset_v1.SearchAllIamPoliciesRequest(
-        scope=org_name,
-        asset_types=ASSET_TYPES,
+def analyze_iam(client, organization_name):
+    query = asset_v1.IamPolicyAnalysisQuery(
+        scope=organization_name,
+        options=asset_v1.IamPolicyAnalysisQuery.Options(
+            expand_groups=True,
+            output_group_edges=True,
+        ),
     )
-
-    for result in client.search_all_iam_policies(request=request):
-        key = resource_key(result.resource)
-        resource = resource_names.get(key, key)
-
-        for binding in result.policy.bindings:
-            role = binding.role
-            if binding.condition and binding.condition.expression:
-                role += " [conditional]"
-
-            for member in binding.members:
-                yield member, resource, role
-
-
-def expand_group(service, group_email, cache, ancestry=None):
-    """Return all human users in a Google Group, recursively."""
-    group_email = group_email.lower()
-
-    if group_email in cache:
-        return cache[group_email]
-
-    ancestry = ancestry or set()
-    if group_email in ancestry:
-        return set()
-
-    group_name = (
-        service.groups()
-        .lookup(groupKey_id=group_email)
-        .execute(num_retries=3)["name"]
+    response = client.analyze_iam_policy(
+        request=asset_v1.AnalyzeIamPolicyRequest(analysis_query=query)
     )
+    analysis = response.main_analysis
 
+    incomplete = (
+            not response.fully_explored
+            or not analysis.fully_explored
+            or any(not result.fully_explored for result in analysis.analysis_results)
+    )
+    if incomplete:
+        causes = "; ".join(
+            error.cause for error in analysis.non_critical_errors if error.cause
+        )
+        raise RuntimeError(
+            "Policy Analyzer returned an incomplete result."
+            + (f" Details: {causes}" if causes else "")
+        )
+
+    return analysis.analysis_results
+
+
+def expanded_users(group, edges):
     users = set()
-    api = service.groups().memberships()
-    request = api.list(parent=group_name, view="FULL", pageSize=500)
+    seen = set()
+    stack = list(edges.get(group, ()))
 
-    while request:
-        response = request.execute(num_retries=3)
+    while stack:
+        principal = stack.pop()
+        if principal in seen:
+            continue
+        seen.add(principal)
 
-        for membership in response.get("memberships", []):
-            email = membership.get("preferredMemberKey", {}).get("id")
-            member_type = membership.get("type")
+        if principal.startswith("user:"):
+            users.add(principal)
+        elif principal.startswith("group:"):
+            stack.extend(edges.get(principal, ()))
 
-            if not email:
-                continue
-
-            if member_type == "USER":
-                users.add(email.lower())
-            elif member_type == "GROUP":
-                users.update(
-                    expand_group(
-                        service,
-                        email,
-                        cache,
-                        ancestry | {group_email},
-                        )
-                )
-
-        request = api.list_next(request, response)
-
-    cache[group_email] = users
     return users
 
 
-def main():
-    credentials, _ = google.auth.default(
-        scopes=["https://www.googleapis.com/auth/cloud-platform"]
-    )
-    organization = get_organization(credentials)
-
-    print(
-        f"Organization: {organization.get('displayName', 'unknown')} "
-        f"({organization['name']})"
-    )
-    print("Resolving Organization, Folder and Project display names...")
-    resource_names = get_resource_names(
-        organization["name"], organization, credentials
+def build_inventory(results, resource_names):
+    users = defaultdict(
+        lambda: {"groups": set(), "resources": set(), "roles": set()}
     )
 
-    print("Scanning Organization, Folder and Project IAM...")
+    for result in results:
+        full_resource = result.attached_resource_full_name
+        kind = resource_type(full_resource)
+        if not kind:
+            continue
 
-    users = defaultdict(lambda: {"groups": set(), "resources": set(), "roles": set()})
-    group_bindings = defaultdict(list)
-
-    for member, resource, role in get_iam_bindings(
-            organization["name"], credentials, resource_names
-    ):
-        if member.startswith("user:"):
-            email = member.removeprefix("user:").lower()
-            users[email]["resources"].add(resource)
-            users[email]["roles"].add(role)
-        elif member.startswith("group:"):
-            group = member.removeprefix("group:").lower()
-            group_bindings[group].append((resource, role))
-
-    if group_bindings:
-        print(f"Expanding {len(group_bindings)} IAM groups...")
-        identity = build(
-            "cloudidentity", "v1",
-            credentials=credentials,
-            cache_discovery=False,
+        resource = resource_names.get(
+            full_resource,
+            f"{kind}:{full_resource.rsplit('/', 1)[-1]}",
         )
-        cache = {}
+        binding = result.iam_binding
+        role = binding.role
+        if binding.condition and binding.condition.expression:
+            role += " [conditional]"
 
-        for index, group in enumerate(sorted(group_bindings), 1):
-            print(f"[{index}/{len(group_bindings)}] {group}")
+        for member in binding.members:
+            if member.startswith("user:"):
+                email = member.removeprefix("user:").lower()
+                users[email]["resources"].add(resource)
+                users[email]["roles"].add(role)
 
-            for email in expand_group(identity, group, cache):
-                users[email]["groups"].add(group)
-                for resource, role in group_bindings[group]:
-                    users[email]["resources"].add(resource)
-                    users[email]["roles"].add(role)
+        edges = defaultdict(set)
+        for edge in result.identity_list.group_edges:
+            edges[edge.source_node.lower()].add(edge.target_node.lower())
 
+        for member in binding.members:
+            if not member.startswith("group:"):
+                continue
+
+            group = member.lower()
+            group_email = group.removeprefix("group:")
+
+            for principal in expanded_users(group, edges):
+                email = principal.removeprefix("user:")
+                users[email]["groups"].add(group_email)
+                users[email]["resources"].add(resource)
+                users[email]["roles"].add(role)
+
+    return users
+
+
+def write_csv(users):
     with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=["user", "group", "resource", "role"])
+        writer = csv.DictWriter(
+            file, fieldnames=["user", "group", "resource", "role"]
+        )
         writer.writeheader()
 
         for email, data in sorted(users.items()):
-            writer.writerow({
-                "user": email,
-                "group": ";".join(sorted(data["groups"])),
-                "resource": ";".join(sorted(data["resources"])),
-                "role": ";".join(sorted(data["roles"])),
-            })
+            writer.writerow(
+                {
+                    "user": email,
+                    "group": ";".join(sorted(data["groups"])),
+                    "resource": ";".join(sorted(data["resources"])),
+                    "role": ";".join(sorted(data["roles"])),
+                }
+            )
 
-    print("\n========== SUMMARY ==========")
-    print(f"Unique human users: {len(users)}")
+
+def main():
+    organization = get_organization()
+    asset_client = asset_v1.AssetServiceClient()
+
+    print(
+        f"Organization: {organization.display_name or 'unknown'} "
+        f"({organization.name})"
+    )
+    print("Resolving Organization, Folder and Project display names...")
+    resource_names = get_resource_names(asset_client, organization)
+
+    print("Analyzing IAM and expanding Google Groups...")
+    users = build_inventory(
+        analyze_iam(asset_client, organization.name),
+        resource_names,
+    )
+    write_csv(users)
+
+    print("\n=============== SUMMARY ===============")
     print(f"Report written to: ./{OUTPUT_FILE}")
+    print(f"Unique human users with GCP IAM access: {len(users)}")
 
 
 if __name__ == "__main__":
