@@ -1,29 +1,41 @@
 #!/usr/bin/env python3
 """
 GCP Human IAM User Inventory
+============================
 
-Creates effective_user_access.csv with one row per unique human user that has
-an IAM allow-policy binding at Organization, Folder, or Project level.
+Purpose:
+    Create ./effective_user_access.csv containing one row per unique human user
+    with IAM access granted at Organization, Folder, or Project level.
 
-Google Groups are expanded by Cloud Asset Policy Analyzer, including nested
-groups.
+How it works:
+    - Finds the single visible GCP organization automatically.
+    - Searches Organization/Folder/Project IAM policies with Cloud Asset.
+    - Adds direct `user:` principals.
+    - Expands IAM-bound Google Groups with Cloud Asset Policy Analyzer,
+      including nested groups.
+    - Deduplicates users and aggregates their groups, resources, and roles.
 
 CSV columns:
     user, group, resource, role
 
-Multiple groups/resources/roles are semicolon-separated and independently
-aggregated. Resource-level IAM below Project and non-human principals are
-excluded. Conditional bindings are marked "[conditional]" in the role column.
+Notes:
+    - Lower-level resource IAM (buckets, datasets, secrets, etc.) is excluded.
+    - Service accounts and deleted principals are excluded.
 
 Required APIs:
     cloudasset.googleapis.com
     cloudresourcemanager.googleapis.com
 
-Required Python packages:
+Required packages:
     pip install google-cloud-asset google-cloud-resource-manager
 
-Group expansion requires the Google Workspace `groups.read` privilege and is
-capped by Google at 1,000 members per group.
+Authentication:
+    Uses Application Default Credentials automatically (works in Cloud Shell).
+
+Permissions:
+    GCP: roles/cloudasset.viewer on the organization, plus organization view.
+    Custom roles additionally require iam.roles.get.
+    Google Workspace: groups.read is required for group expansion.
 """
 
 import csv
@@ -34,11 +46,14 @@ from google.cloud import asset_v1, resourcemanager_v3
 
 
 OUTPUT_FILE = "effective_user_access.csv"
+MAX_ROLES_PER_QUERY = 10
+
 ASSET_TYPES = [
     "cloudresourcemanager.googleapis.com/Organization",
     "cloudresourcemanager.googleapis.com/Folder",
     "cloudresourcemanager.googleapis.com/Project",
 ]
+
 RESOURCE_PREFIXES = {
     "//cloudresourcemanager.googleapis.com/organizations/": "organization",
     "//cloudresourcemanager.googleapis.com/folders/": "folder",
@@ -47,30 +62,37 @@ RESOURCE_PREFIXES = {
 
 
 def get_organization():
-    organizations = list(
-        resourcemanager_v3.OrganizationsClient().search_organizations()
-    )
-    if len(organizations) != 1:
+    orgs = list(resourcemanager_v3.OrganizationsClient().search_organizations())
+    if len(orgs) != 1:
         raise RuntimeError(
-            f"Expected exactly one visible GCP organization, found {len(organizations)}."
+            f"Expected exactly one visible GCP organization, found {len(orgs)}."
         )
-    return organizations[0]
+    return orgs[0]
 
 
-def resource_type(name):
-    return next(
-        (kind for prefix, kind in RESOURCE_PREFIXES.items() if name.startswith(prefix)),
-        None,
-    )
+def resource_type(full_name):
+    for prefix, kind in RESOURCE_PREFIXES.items():
+        if full_name.startswith(prefix):
+            return kind
+    return None
+
+
+def resource_label(full_name, resource_names):
+    if full_name in resource_names:
+        return resource_names[full_name]
+
+    kind = resource_type(full_name)
+    resource_id = full_name.rsplit("/", 1)[-1]
+    return f"{kind}:{resource_id}" if kind else full_name
 
 
 def get_resource_names(client, organization):
-    names = {}
     request = asset_v1.SearchAllResourcesRequest(
         scope=organization.name,
         asset_types=ASSET_TYPES,
     )
 
+    names = {}
     for resource in client.search_all_resources(request=request):
         kind = resource_type(resource.name)
         if not kind:
@@ -87,63 +109,123 @@ def get_resource_names(client, organization):
     org_full_name = f"//cloudresourcemanager.googleapis.com/{organization.name}"
     names.setdefault(
         org_full_name,
-        f"organization:{organization.display_name or org_id} ({org_id})",
+        (
+            f"organization:{organization.display_name} ({org_id})"
+            if organization.display_name
+            else f"organization:{org_id}"
+        ),
     )
     return names
 
 
-def get_relevant_roles(client, organization_name):
-    """Return roles used on Organization, Folder, or Project IAM bindings."""
+def new_inventory():
+    return defaultdict(lambda: {"groups": set(), "resources": set(), "roles": set()})
+
+
+def role_label(binding):
+    if binding.condition and binding.condition.expression:
+        return f"{binding.role} [conditional]"
+    return binding.role
+
+
+def scan_iam(client, organization_name, resource_names):
+    """Collect direct users and roles that require Google Group expansion."""
     request = asset_v1.SearchAllIamPoliciesRequest(
         scope=organization_name,
         asset_types=ASSET_TYPES,
     )
 
-    roles = set()
-    for policy in client.search_all_iam_policies(request=request):
-        for binding in policy.policy.bindings:
-            if binding.role:
-                roles.add(binding.role)
+    users = new_inventory()
+    group_roles = set()
+    unsupported_principals = set()
 
-    return sorted(roles)
+    for result in client.search_all_iam_policies(request=request):
+        resource = resource_label(result.resource, resource_names)
 
+        for binding in result.policy.bindings:
+            label = role_label(binding)
 
-def analyze_iam(client, organization_name, roles):
-    """Analyze all relevant IAM roles and expand Google Group membership."""
-    query = asset_v1.IamPolicyAnalysisQuery(
-        scope=organization_name,
-        access_selector=asset_v1.IamPolicyAnalysisQuery.AccessSelector(
-            roles=roles,
-        ),
-        options=asset_v1.IamPolicyAnalysisQuery.Options(
-            expand_groups=True,
-            output_group_edges=True,
-        ),
-    )
-    response = client.analyze_iam_policy(
-        request=asset_v1.AnalyzeIamPolicyRequest(analysis_query=query)
-    )
-    analysis = response.main_analysis
+            for member in binding.members:
+                principal = member.lower()
 
-    incomplete = (
-            not response.fully_explored
-            or not analysis.fully_explored
-            or any(not result.fully_explored for result in analysis.analysis_results)
-    )
-    if incomplete:
-        causes = "; ".join(
-            error.cause for error in analysis.non_critical_errors if error.cause
-        )
+                if principal.startswith("user:"):
+                    email = principal.removeprefix("user:")
+                    users[email]["resources"].add(resource)
+                    users[email]["roles"].add(label)
+
+                elif principal.startswith("group:"):
+                    group_roles.add(binding.role)
+
+                elif (
+                        principal.startswith("serviceaccount:")
+                        or principal.startswith("deleted:")
+                ):
+                    continue
+
+                else:
+                    # domain:, allAuthenticatedUsers, workforce principalSet,
+                    # legacy projectOwner/projectEditor principals, etc. cannot
+                    # be safely converted into a finite human-user list here.
+                    unsupported_principals.add(member)
+
+    if unsupported_principals:
+        examples = ", ".join(sorted(unsupported_principals)[:5])
         raise RuntimeError(
-            "Policy Analyzer returned an incomplete result."
-            + (f" Details: {causes}" if causes else "")
+            "Cannot guarantee a complete human-user inventory because IAM "
+            f"contains unsupported broad principals: {examples}"
         )
 
-    return analysis.analysis_results
+    return users, sorted(group_roles)
+
+
+def batched(values, size):
+    for index in range(0, len(values), size):
+        yield values[index : index + size]
+
+
+def analyze_group_roles(client, organization_name, roles):
+    """Run Policy Analyzer in batches of at most 10 roles."""
+    batches = list(batched(roles, MAX_ROLES_PER_QUERY))
+
+    for number, role_batch in enumerate(batches, start=1):
+        if len(batches) > 1:
+            print(f"  Policy Analyzer batch {number}/{len(batches)}")
+
+        query = asset_v1.IamPolicyAnalysisQuery(
+            scope=organization_name,
+            access_selector=asset_v1.IamPolicyAnalysisQuery.AccessSelector(
+                roles=role_batch
+            ),
+            options=asset_v1.IamPolicyAnalysisQuery.Options(
+                expand_groups=True,
+                output_group_edges=True,
+            ),
+        )
+
+        response = client.analyze_iam_policy(
+            request=asset_v1.AnalyzeIamPolicyRequest(analysis_query=query)
+        )
+        analysis = response.main_analysis
+
+        if (
+                not response.fully_explored
+                or not analysis.fully_explored
+                or any(not result.fully_explored for result in analysis.analysis_results)
+        ):
+            causes = "; ".join(
+                sorted({e.cause for e in analysis.non_critical_errors if e.cause})
+            )
+            raise RuntimeError(
+                "Policy Analyzer returned an incomplete result"
+                + (f": {causes}" if causes else ".")
+            )
+
+        yield from analysis.analysis_results
 
 
 def expanded_users(group, edges):
-    users = set()
+    """Walk Policy Analyzer group edges and return reachable user principals."""
+    found = set()
     seen = set()
     stack = list(edges.get(group, ()))
 
@@ -154,64 +236,45 @@ def expanded_users(group, edges):
         seen.add(principal)
 
         if principal.startswith("user:"):
-            users.add(principal)
+            found.add(principal)
         elif principal.startswith("group:"):
             stack.extend(edges.get(principal, ()))
 
-    return users
+    return found
 
 
-def build_inventory(results, resource_names):
-    users = defaultdict(
-        lambda: {"groups": set(), "resources": set(), "roles": set()}
-    )
-
-    for result in results:
+def add_group_users(users, analysis_results, resource_names):
+    for result in analysis_results:
         full_resource = result.attached_resource_full_name
-        kind = resource_type(full_resource)
-        if not kind:
+        if not resource_type(full_resource):
             continue
 
-        resource = resource_names.get(
-            full_resource,
-            f"{kind}:{full_resource.rsplit('/', 1)[-1]}",
-        )
-        binding = result.iam_binding
-        role = binding.role
-        if binding.condition and binding.condition.expression:
-            role += " [conditional]"
-
-        for member in binding.members:
-            if member.startswith("user:"):
-                email = member.removeprefix("user:").lower()
-                users[email]["resources"].add(resource)
-                users[email]["roles"].add(role)
+        groups = [
+            member.lower()
+            for member in result.iam_binding.members
+            if member.lower().startswith("group:")
+        ]
+        if not groups:
+            continue
 
         edges = defaultdict(set)
         for edge in result.identity_list.group_edges:
             edges[edge.source_node.lower()].add(edge.target_node.lower())
 
-        for member in binding.members:
-            if not member.startswith("group:"):
-                continue
+        resource = resource_label(full_resource, resource_names)
+        role = role_label(result.iam_binding)
 
-            group = member.lower()
-            group_email = group.removeprefix("group:")
-
+        for group in groups:
             for principal in expanded_users(group, edges):
                 email = principal.removeprefix("user:")
-                users[email]["groups"].add(group_email)
+                users[email]["groups"].add(group.removeprefix("group:"))
                 users[email]["resources"].add(resource)
                 users[email]["roles"].add(role)
-
-    return users
 
 
 def write_csv(users):
     with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(
-            file, fieldnames=["user", "group", "resource", "role"]
-        )
+        writer = csv.DictWriter(file, fieldnames=["user", "group", "resource", "role"])
         writer.writeheader()
 
         for email, data in sorted(users.items()):
@@ -227,26 +290,27 @@ def write_csv(users):
 
 def main():
     organization = get_organization()
-    asset_client = asset_v1.AssetServiceClient()
+    client = asset_v1.AssetServiceClient()
 
-    print(
-        f"Organization: {organization.display_name or 'unknown'} "
-        f"({organization.name})"
-    )
+    print(f"Organization: {organization.display_name or 'unknown'} ({organization.name})")
     print("Resolving Organization, Folder and Project display names...")
-    resource_names = get_resource_names(asset_client, organization)
+    resource_names = get_resource_names(client, organization)
 
-    print("Discovering IAM roles used at Organization, Folder and Project level...")
-    roles = get_relevant_roles(asset_client, organization.name)
+    print("Scanning Organization, Folder and Project IAM...")
+    users, group_roles = scan_iam(client, organization.name, resource_names)
 
-    if roles:
-        print("Analyzing IAM and expanding Google Groups...")
-        users = build_inventory(
-            analyze_iam(asset_client, organization.name, roles),
+    if group_roles:
+        query_count = (len(group_roles) + MAX_ROLES_PER_QUERY - 1) // MAX_ROLES_PER_QUERY
+        print(
+            f"Expanding Google Groups ({len(group_roles)} group-bound IAM roles, "
+            f"{query_count} Policy Analyzer quer{'y' if query_count == 1 else 'ies'})..."
+        )
+        add_group_users(
+            users,
+            analyze_group_roles(client, organization.name, group_roles),
             resource_names,
         )
-    else:
-        users = {}
+
     write_csv(users)
 
     print(f"Report written to: ./{OUTPUT_FILE}")
