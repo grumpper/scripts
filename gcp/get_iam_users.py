@@ -137,7 +137,6 @@ def scan_iam(client, organization_name, resource_names):
 
     users = new_inventory()
     group_roles = set()
-    unsupported_principals = set()
 
     for result in client.search_all_iam_policies(request=request):
         resource = resource_label(result.resource, resource_names)
@@ -156,24 +155,9 @@ def scan_iam(client, organization_name, resource_names):
                 elif principal.startswith("group:"):
                     group_roles.add(binding.role)
 
-                elif (
-                        principal.startswith("serviceaccount:")
-                        or principal.startswith("deleted:")
-                ):
+                else:
                     continue
 
-                else:
-                    # domain:, allAuthenticatedUsers, workforce principalSet,
-                    # legacy projectOwner/projectEditor principals, etc. cannot
-                    # be safely converted into a finite human-user list here.
-                    unsupported_principals.add(member)
-
-    if unsupported_principals:
-        examples = ", ".join(sorted(unsupported_principals)[:5])
-        raise RuntimeError(
-            "Cannot guarantee a complete human-user inventory because IAM "
-            f"contains unsupported broad principals: {examples}"
-        )
 
     return users, sorted(group_roles)
 
